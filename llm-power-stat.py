@@ -171,7 +171,10 @@ class LLMPowerStat:
             f"Warmed up for {int((int(time.monotonic()) - start_time) / 60)} minutes."
         )
 
+    # No-op in dry run, so callers don't need to check.
     def set_power(self, power_values: list[int]):
+        if self.dry_run:
+            return
         for i, gpu in enumerate(self.gpus):
             self.run_smi(["-i", gpu.uuid, "-pl", str(power_values[i])])
 
@@ -204,8 +207,7 @@ class LLMPowerStat:
                 end="",
                 flush=True,
             )
-            if not self.dry_run:
-                self.set_power(power_value)
+            self.set_power(power_value)
             tps: float = self.run_prompt() if not self.dry_run else 0.0
             print(f" TPS={tps:.2f}", flush=True)
             yield power_value + [tps]
