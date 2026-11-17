@@ -158,11 +158,11 @@ class LLMPowerStat:
         print(f"Warming up for at least {self.warmup_minutes} minutes...")
 
         start_time: int = int(time.monotonic())
-        while int(time.monotonic()) < start_time + self.warmup_minutes * 60:
-            print(".", end="", flush=True)
-            if not self.dry_run:
+        if not self.dry_run:
+            while int(time.monotonic()) < start_time + self.warmup_minutes * 60:
+                print(".", end="", flush=True)
                 self.run_prompt()
-        print()
+        print(flush=True)
 
         print(
             f"Warmed up for {int((int(time.monotonic()) - start_time) / 60)} minutes."
