@@ -156,6 +156,9 @@ class LLMPowerStat:
     # It will not kill the last query.
     def warmup(self) -> None:
         print(f"Warming up for at least {self.warmup_minutes} minutes...")
+        print("Setting default power limits...")
+        self.set_power([x.power_default_limit for x in self.gpus])
+        print("Running prompts...")
 
         start_time: int = int(time.monotonic())
         if not self.dry_run:
