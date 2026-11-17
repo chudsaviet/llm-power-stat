@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import contextlib
+import csv
 import re
+import signal
 import subprocess
 import sys
 import textwrap
@@ -17,8 +19,20 @@ POWER_SAMPLING_INTERVAL_SEC: float = 1.0
 
 
 # Diagnostics go to STDERR so STDOUT carries only CSV data.
+# Write errors are ignored: after an SSH hangup the terminal is gone, and a failed
+# log line must not abort the run or, worse, the power limit restore on exit.
 def log(*args, **kwargs) -> None:
-    print(*args, file=sys.stderr, **kwargs)
+    try:
+        print(*args, file=sys.stderr, **kwargs)
+    except OSError:
+        pass
+
+
+# SIGTERM (kill, systemd stop) and SIGHUP (closed terminal / SSH session) would
+# otherwise end the process without running __exit__, leaving GPUs power-limited.
+# Raising SystemExit unwinds the stack normally, so the limits get restored.
+def raise_system_exit(signum: int, frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 # Accepts "host:port", "http(s)://host:port" and the OpenAI-style ".../v1" base URL.
@@ -102,11 +116,10 @@ class LLMPowerStat:
     def __enter__(self) -> Self:
         return self
 
-    # Runs on normal exit, on exceptions and on Ctrl+C (KeyboardInterrupt).
+    # Runs on normal exit, on exceptions, on Ctrl+C (KeyboardInterrupt) and on SIGTERM/SIGHUP.
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
-            log(f"Restoring original power limits {self.original_power_limits}...")
-            self.set_power(self.original_power_limits)
+            self.restore_power()
         finally:
             try:
                 self.runner.run(self.http_client.aclose())
@@ -186,7 +199,6 @@ class LLMPowerStat:
         power_checks: int = 0
         power_accumulators: list[float] = [0.0 for x in self.gpus]
         try:
-            start_time: float = time.monotonic()
             async_task: asyncio.Task = asyncio.create_task(
                 self.http_client.post(
                     "/v1/chat/completions",
@@ -204,7 +216,6 @@ class LLMPowerStat:
                         [async_task], timeout=POWER_SAMPLING_INTERVAL_SEC
                     )
                     if done:
-                        elapsed_sec: float = time.monotonic() - start_time
                         response = async_task.result()
                         break
 
@@ -227,7 +238,9 @@ class LLMPowerStat:
             ) from None
 
         if response.status_code != 200:
-            raise SystemError(f"API endpoint returned {response.status_code}!")
+            raise RuntimeError(
+                f"API endpoint returned {response.status_code}: {response.text[:500]}"
+            )
 
         # The request finished before the first sampling interval elapsed.
         # Sample once right away: nvidia-smi's power.draw is averaged over a short
@@ -236,19 +249,20 @@ class LLMPowerStat:
             power_checks = 1
             power_accumulators = await asyncio.to_thread(self.get_current_power)
 
-        return self.parse_tps(response.json(), elapsed_sec), [
+        return self.parse_tps(response.json()), [
             int(x / power_checks) for x in power_accumulators
         ]
 
-    # "timings" is a llama.cpp extension: pure generation speed, excluding prompt processing.
-    # Other OpenAI-compatible servers only report "usage", so fall back to
-    # completion tokens over the request's wall time (which includes prompt processing).
+    # llama.cpp's server measures generation speed itself (excluding prompt processing)
+    # and reports it in "timings", an extension other OpenAI-compatible servers don't send.
     @staticmethod
-    def parse_tps(body: dict, elapsed_sec: float) -> float:
-        timings = body.get("timings")
-        if timings is not None and "predicted_per_second" in timings:
-            return float(timings["predicted_per_second"])
-        return float(body["usage"]["completion_tokens"]) / elapsed_sec
+    def parse_tps(body: dict) -> float:
+        try:
+            return float(body["timings"]["predicted_per_second"])
+        except (KeyError, TypeError):
+            raise RuntimeError(
+                "Response has no timings.predicted_per_second; is the API endpoint a llama.cpp server?"
+            ) from None
 
     # It can warm up for a little more minutes than specified, because it just runs the query until the time is up.
     # It will not kill the last query.
@@ -275,6 +289,22 @@ class LLMPowerStat:
             return
         for i, gpu in enumerate(self.gpus):
             self.run_smi(["-i", gpu.uuid, "-pl", str(power_values[i])])
+
+    # Unlike set_power, keeps going when one GPU fails, so every other GPU still
+    # gets its limit back. Raises at the end if any GPU could not be restored.
+    def restore_power(self) -> None:
+        if self.dry_run:
+            return
+        log(f"Restoring original power limits {self.original_power_limits}...")
+        failed: list[str] = []
+        for gpu, limit in zip(self.gpus, self.original_power_limits):
+            try:
+                self.run_smi(["-i", gpu.uuid, "-pl", str(limit)])
+            except Exception as e:
+                log(f"Failed to restore power limit of {gpu.uuid} to {limit}W: {e}")
+                failed.append(gpu.uuid)
+        if failed:
+            raise RuntimeError(f"Could not restore power limits of {', '.join(failed)}.")
 
     def gen_power_steps(self, gpus: list[GPU]) -> Iterator[list[int]]:
         if len(gpus) > 0:
@@ -324,7 +354,7 @@ def main() -> None:
         "--api_endpoint",
         type=str,
         required=True,
-        help="OpenAI-compatible API endpoint, e.g. localhost:8080 or https://host/v1. http:// is assumed if no scheme is given.",
+        help="llama.cpp server API endpoint, e.g. localhost:8080 or https://host/v1. http:// is assumed if no scheme is given.",
     )
 
     parser.add_argument(
@@ -403,6 +433,9 @@ def main() -> None:
         f"Running power vs tokens-per-second test using {to_base_url(args.api_endpoint)} API endpoint."
     )
 
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, raise_system_exit)
+
     with LLMPowerStat(
         api_endpoint=args.api_endpoint,
         api_key_file=args.api_key_file,
@@ -417,8 +450,8 @@ def main() -> None:
 
 
 # Matches the row layout from run_analysis(): timestamp, all power limits, all average draws, TPS.
-def csv_header(gpu_count: int) -> str:
-    return ", ".join(
+def csv_header(gpu_count: int) -> list[str]:
+    return (
         ["Timestamp"]
         + [f"GPU{i} power limit W" for i in range(gpu_count)]
         + [f"GPU{i} avg power W" for i in range(gpu_count)]
@@ -427,18 +460,20 @@ def csv_header(gpu_count: int) -> str:
 
 
 def run(power_stat: LLMPowerStat, output_file: str | None) -> None:
-    header: str = csv_header(len(power_stat.gpus))
+    header: list[str] = csv_header(len(power_stat.gpus))
 
     # Open the file before the warmup, so a bad path fails right away rather than after it.
-    # Append mode: rows from earlier runs are kept.
+    # Append mode: rows from earlier runs are kept. newline="" is what the csv module expects.
     with (
-        open(output_file, "a")
+        open(output_file, "a", newline="")
         if output_file is not None
         else contextlib.nullcontext(sys.stdout)
     ) as out:
+        # "\n" rather than the csv module's default "\r\n", matching files from earlier runs.
+        writer = csv.writer(out, lineterminator="\n")
         # Only a new (or empty) file gets the header, so appended runs don't repeat it.
         if output_file is not None and out.tell() == 0:
-            out.write(header + "\n")
+            writer.writerow(header)
             out.flush()
 
         power_stat.print_gpus()
@@ -446,10 +481,10 @@ def run(power_stat: LLMPowerStat, output_file: str | None) -> None:
             power_stat.warmup()
 
         if output_file is None:
-            log(header)
+            log(",".join(header))
 
         for row in power_stat.run_analysis():
-            out.write(", ".join([str(x) for x in row]) + "\n")
+            writer.writerow(row)
             out.flush()
 
 
