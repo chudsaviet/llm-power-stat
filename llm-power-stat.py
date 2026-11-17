@@ -1,10 +1,13 @@
 import argparse
 import asyncio
+import contextlib
 import re
 import subprocess
+import sys
 import textwrap
 import time
 from collections.abc import Iterator
+from datetime import datetime
 from typing import NamedTuple, Self
 
 import httpx
@@ -12,7 +15,18 @@ import httpx
 SMI_EXECUTABLE: str = "/usr/bin/nvidia-smi"
 POWER_SAMPLING_INTERVAL_SEC: float = 1.0
 
-# TODO: Remember power limits before changing them, and restore them on exit even in case of error!
+
+# Diagnostics go to STDERR so STDOUT carries only CSV data.
+def log(*args, **kwargs) -> None:
+    print(*args, file=sys.stderr, **kwargs)
+
+
+# Accepts "host:port", "http(s)://host:port" and the OpenAI-style ".../v1" base URL.
+# Requests add "/v1/..." themselves, so a trailing "/v1" is dropped.
+def to_base_url(api_endpoint: str) -> str:
+    url: str = api_endpoint if "://" in api_endpoint else f"http://{api_endpoint}"
+    url = url.rstrip("/")
+    return url.removesuffix("/v1")
 
 
 class GPU(NamedTuple):
@@ -54,8 +68,13 @@ class LLMPowerStat:
         self.warmup_minutes: int = warmup_minutes
         self.dry_run = dry_run
 
-        print("Listing local GPUs...")
+        log("Listing local GPUs...")
         self.gpus: list[GPU] = self.list_gpus()
+        # Limits in effect before the script changed anything; __exit__ restores them.
+        self.original_power_limits: list[float] = [
+            float(self.query_gpu(gpu.uuid, ["power.limit"])[0].rstrip("W").strip())
+            for gpu in self.gpus
+        ]
 
         self.api_key: str | None = None
         if self.api_key_file is not None:
@@ -75,7 +94,7 @@ class LLMPowerStat:
         # is bound to the loop it first runs on, so asyncio.run() per call would break it.
         self.runner: asyncio.Runner = asyncio.Runner()
         self.http_client: httpx.AsyncClient = httpx.AsyncClient(
-            base_url=f"http://{self.api_endpoint}",
+            base_url=to_base_url(self.api_endpoint),
             headers=headers,
             timeout=httpx.Timeout(10.0, read=None),
         )
@@ -83,11 +102,16 @@ class LLMPowerStat:
     def __enter__(self) -> Self:
         return self
 
+    # Runs on normal exit, on exceptions and on Ctrl+C (KeyboardInterrupt).
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
-            self.runner.run(self.http_client.aclose())
+            log(f"Restoring original power limits {self.original_power_limits}...")
+            self.set_power(self.original_power_limits)
         finally:
-            self.runner.close()
+            try:
+                self.runner.run(self.http_client.aclose())
+            finally:
+                self.runner.close()
 
     # Will throw exception if anything wrong.
     # Returns the stdout. Ignores the stderr.
@@ -143,9 +167,9 @@ class LLMPowerStat:
     # Prints GPUs in list order, numbered the same way nvidia-smi does: "GPU 0: ...".
     def print_gpus(self) -> None:
         for index, gpu in enumerate(self.gpus):
-            print(f"GPU {index}: {gpu.model_name} (UUID: {gpu.uuid})")
-            print(f"  Power default limit: {gpu.power_default_limit}W")
-            print(f"  Power min limit: {gpu.power_min_limit}W")
+            log(f"GPU {index}: {gpu.model_name} (UUID: {gpu.uuid})")
+            log(f"  Power default limit: {gpu.power_default_limit}W")
+            log(f"  Power min limit: {gpu.power_min_limit}W")
 
     def get_current_power(self) -> list[float]:
         result: list[float] = []
@@ -162,6 +186,7 @@ class LLMPowerStat:
         power_checks: int = 0
         power_accumulators: list[float] = [0.0 for x in self.gpus]
         try:
+            start_time: float = time.monotonic()
             async_task: asyncio.Task = asyncio.create_task(
                 self.http_client.post(
                     "/v1/chat/completions",
@@ -175,12 +200,11 @@ class LLMPowerStat:
             response: httpx.Response | None = None
             try:
                 while True:
-                    # TODO: We will have average power = 0.0 if request finished faster than POWER_SAMPLING_INTERVAL_SEC.
-                    # We need a fix for this case.
                     done, _ = await asyncio.wait(
                         [async_task], timeout=POWER_SAMPLING_INTERVAL_SEC
                     )
                     if done:
+                        elapsed_sec: float = time.monotonic() - start_time
                         response = async_task.result()
                         break
 
@@ -205,31 +229,48 @@ class LLMPowerStat:
         if response.status_code != 200:
             raise SystemError(f"API endpoint returned {response.status_code}!")
 
-        return float(response.json()["timings"]["predicted_per_second"]), [
+        # The request finished before the first sampling interval elapsed.
+        # Sample once right away: nvidia-smi's power.draw is averaged over a short
+        # recent window, so it still mostly reflects the just-finished generation.
+        if power_checks == 0:
+            power_checks = 1
+            power_accumulators = await asyncio.to_thread(self.get_current_power)
+
+        return self.parse_tps(response.json(), elapsed_sec), [
             int(x / power_checks) for x in power_accumulators
         ]
+
+    # "timings" is a llama.cpp extension: pure generation speed, excluding prompt processing.
+    # Other OpenAI-compatible servers only report "usage", so fall back to
+    # completion tokens over the request's wall time (which includes prompt processing).
+    @staticmethod
+    def parse_tps(body: dict, elapsed_sec: float) -> float:
+        timings = body.get("timings")
+        if timings is not None and "predicted_per_second" in timings:
+            return float(timings["predicted_per_second"])
+        return float(body["usage"]["completion_tokens"]) / elapsed_sec
 
     # It can warm up for a little more minutes than specified, because it just runs the query until the time is up.
     # It will not kill the last query.
     def warmup(self) -> None:
-        print(f"Warming up for at least {self.warmup_minutes} minutes...")
-        print("Setting default power limits...")
+        log(f"Warming up for at least {self.warmup_minutes} minutes...")
+        log("Setting default power limits...")
         self.set_power([x.power_default_limit for x in self.gpus])
-        print("Running prompts...")
+        log("Running prompts...")
 
         start_time: int = int(time.monotonic())
         if not self.dry_run:
             while int(time.monotonic()) < start_time + self.warmup_minutes * 60:
-                print(".", end="", flush=True)
+                log(".", end="", flush=True)
                 self.run_prompt()
-        print(flush=True)
+        log(flush=True)
 
-        print(
+        log(
             f"Warmed up for {int((int(time.monotonic()) - start_time) / 60)} minutes."
         )
 
     # No-op in dry run, so callers don't need to check.
-    def set_power(self, power_values: list[int]):
+    def set_power(self, power_values: list[float]):
         if self.dry_run:
             return
         for i, gpu in enumerate(self.gpus):
@@ -238,16 +279,13 @@ class LLMPowerStat:
     def gen_power_steps(self, gpus: list[GPU]) -> Iterator[list[int]]:
         if len(gpus) > 0:
             gpu: GPU = gpus.pop()
-            for power in reversed(
-                range(
-                    gpu.power_min_limit,
-                    gpu.power_default_limit + self.power_step_W,
-                    self.power_step_W,
-                )
+            # Step down from the default limit, so it is always tested,
+            # and stop at the last step that is still >= power_min_limit.
+            for power in range(
+                gpu.power_default_limit,
+                gpu.power_min_limit - 1,
+                -self.power_step_W,
             ):
-                if power > gpu.power_default_limit:
-                    continue
-
                 if len(gpus) > 0:
                     for head in self.gen_power_steps(gpus.copy()):
                         head.append(power)
@@ -259,7 +297,7 @@ class LLMPowerStat:
         power_values: Iterator[list[int]] = self.gen_power_steps(self.gpus.copy())
 
         for power_value in power_values:
-            print(
+            log(
                 f"Setting power limits to {power_value}. Running prompt...",
                 end="",
                 flush=True,
@@ -269,8 +307,11 @@ class LLMPowerStat:
                 self.run_prompt() if not self.dry_run else (0.0, [0 for x in self.gpus])
             )
 
-            print(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)
-            yield power_value + [str(x) for x in power_averages] + [tps]
+            log(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)
+            # When the measurement finished, in local time with its UTC offset,
+            # e.g. 2026-11-17T14:03:27+01:00.
+            timestamp: str = datetime.now().astimezone().isoformat(timespec="seconds")
+            yield [timestamp] + power_value + [str(x) for x in power_averages] + [tps]
 
 
 def main() -> None:
@@ -283,7 +324,7 @@ def main() -> None:
         "--api_endpoint",
         type=str,
         required=True,
-        help="OpenAI-compatible API endpoint.",
+        help="OpenAI-compatible API endpoint, e.g. localhost:8080 or https://host/v1. http:// is assumed if no scheme is given.",
     )
 
     parser.add_argument(
@@ -323,7 +364,7 @@ def main() -> None:
         "--prompt",
         type=str,
         required=False,
-        help="Promt to submit to LLM.",
+        help="Prompt to submit to LLM.",
         default="Run full calculation of Pi using the Chudnovsky series down to 128th digit.",
     )
 
@@ -351,8 +392,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    print(
-        f"Running power vs tokens-per-second test using http://{args.api_endpoint} API endpoint."
+    if args.power_step_W <= 0:
+        parser.error("--power_step_W must be positive.")
+    if args.tokens_limit <= 0:
+        parser.error("--tokens_limit must be positive.")
+    if args.warmup_minutes < 0:
+        parser.error("--warmup_minutes must not be negative.")
+
+    log(
+        f"Running power vs tokens-per-second test using {to_base_url(args.api_endpoint)} API endpoint."
     )
 
     with LLMPowerStat(
@@ -368,26 +416,41 @@ def main() -> None:
         run(power_stat, args.output_file)
 
 
+# Matches the row layout from run_analysis(): timestamp, all power limits, all average draws, TPS.
+def csv_header(gpu_count: int) -> str:
+    return ", ".join(
+        ["Timestamp"]
+        + [f"GPU{i} power limit W" for i in range(gpu_count)]
+        + [f"GPU{i} avg power W" for i in range(gpu_count)]
+        + ["TPS"]
+    )
+
+
 def run(power_stat: LLMPowerStat, output_file: str | None) -> None:
-    power_stat.print_gpus()
-    if power_stat.warmup_minutes > 0:
-        power_stat.warmup()
+    header: str = csv_header(len(power_stat.gpus))
 
-    results: Iterator = power_stat.run_analysis()
+    # Open the file before the warmup, so a bad path fails right away rather than after it.
+    # Append mode: rows from earlier runs are kept.
+    with (
+        open(output_file, "a")
+        if output_file is not None
+        else contextlib.nullcontext(sys.stdout)
+    ) as out:
+        # Only a new (or empty) file gets the header, so appended runs don't repeat it.
+        if output_file is not None and out.tell() == 0:
+            out.write(header + "\n")
+            out.flush()
 
-    if output_file is None:
-        for row in results:
-            print(", ".join([str(x) for x in row]))
-        return
+        power_stat.print_gpus()
+        if power_stat.warmup_minutes > 0:
+            power_stat.warmup()
 
-    with open(output_file, "+w") as f:
-        f.write(
-            f"{', '.join([f'GPU{x!s} watts' for x in range(len(power_stat.gpus))])}, TPS\n"
-        )
-        for row in results:
-            f.write(", ".join([str(x) for x in row]))
-            f.write("\n")
-            f.flush()
+        if output_file is None:
+            log(header)
+
+        for row in power_stat.run_analysis():
+            out.write(", ".join([str(x) for x in row]) + "\n")
+            out.flush()
 
 
 if __name__ == "__main__":
