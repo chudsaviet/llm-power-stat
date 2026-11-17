@@ -54,6 +54,11 @@ class LLMPowerStat:
             with open(self.api_key_file) as f:
                 # Strip the trailing newline: h11 rejects header values containing "\n".
                 self.api_key = f.read().strip()
+            # Fail early with our own message: h11's header error would print the key.
+            if not (self.api_key.isascii() and self.api_key.isprintable()):
+                raise ValueError(
+                    f"API key in {self.api_key_file} contains non-printable or non-ASCII characters."
+                )
 
         headers: dict[str, str] = {}
         if self.api_key is not None:
@@ -123,13 +128,20 @@ class LLMPowerStat:
             print(f"  Power min limit: {gpu.power_min_limit}W")
 
     def run_prompt(self) -> float:
-        response: httpx.Response = self.http_client.post(
-            "/v1/chat/completions",
-            json={
-                "messages": [{"role": "user", "content": self.prompt}],
-                "max_tokens": self.tokens_limit,
-            },
-        )
+        try:
+            response: httpx.Response = self.http_client.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": self.prompt}],
+                    "max_tokens": self.tokens_limit,
+                },
+            )
+        except httpx.LocalProtocolError:
+            # h11's message includes the offending header value, i.e. the API key.
+            # "from None" keeps Python from printing the original exception too.
+            raise RuntimeError(
+                "Invalid HTTP request headers (check the API key file)."
+            ) from None
 
         if response.status_code != 200:
             raise SystemError(f"API endpoint returned {response.status_code}!")
