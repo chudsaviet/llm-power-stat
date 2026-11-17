@@ -1,14 +1,18 @@
 import argparse
+import asyncio
 import re
 import subprocess
 import textwrap
 import time
 from collections.abc import Iterator
-from typing import NamedTuple
+from typing import NamedTuple, Self
 
 import httpx
 
 SMI_EXECUTABLE: str = "/usr/bin/nvidia-smi"
+POWER_SAMPLING_INTERVAL_SEC: float = 1.0
+
+# TODO: Remember power limits before changing them, and restore them on exit even in case of error!
 
 
 class GPU(NamedTuple):
@@ -67,11 +71,23 @@ class LLMPowerStat:
         headers: dict[str, str] = {}
         if self.api_key is not None:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        self.http_client: httpx.Client = httpx.Client(
+        # One event loop for the object's lifetime: the AsyncClient's connection pool
+        # is bound to the loop it first runs on, so asyncio.run() per call would break it.
+        self.runner: asyncio.Runner = asyncio.Runner()
+        self.http_client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=f"http://{self.api_endpoint}",
             headers=headers,
             timeout=httpx.Timeout(10.0, read=None),
         )
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            self.runner.run(self.http_client.aclose())
+        finally:
+            self.runner.close()
 
     # Will throw exception if anything wrong.
     # Returns the stdout. Ignores the stderr.
@@ -131,15 +147,54 @@ class LLMPowerStat:
             print(f"  Power default limit: {gpu.power_default_limit}W")
             print(f"  Power min limit: {gpu.power_min_limit}W")
 
-    def run_prompt(self) -> float:
+    def get_current_power(self) -> list[float]:
+        result: list[float] = []
+        for gpu in self.gpus:
+            smi_output = self.run_smi(["-i", gpu.uuid, "--query-gpu", "power.draw"])
+            result.append(float(smi_output.split("\n")[1].rstrip("W").strip()))
+        return result
+
+    # Sync entry point: runs the async version on the object's event loop.
+    def run_prompt(self) -> tuple[float, list[int]]:
+        return self.runner.run(self._run_prompt_async())
+
+    async def _run_prompt_async(self) -> tuple[float, list[int]]:
+        power_checks: int = 0
+        power_accumulators: list[float] = [0.0 for x in self.gpus]
         try:
-            response: httpx.Response = self.http_client.post(
-                "/v1/chat/completions",
-                json={
-                    "messages": [{"role": "user", "content": self.prompt}],
-                    "max_tokens": self.tokens_limit,
-                },
+            async_task: asyncio.Task = asyncio.create_task(
+                self.http_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [{"role": "user", "content": self.prompt}],
+                        "max_tokens": self.tokens_limit,
+                    },
+                )
             )
+
+            response: httpx.Response | None = None
+            try:
+                while True:
+                    # TODO: We will have average power = 0.0 if request finished faster than POWER_SAMPLING_INTERVAL_SEC.
+                    # We need a fix for this case.
+                    done, _ = await asyncio.wait(
+                        [async_task], timeout=POWER_SAMPLING_INTERVAL_SEC
+                    )
+                    if done:
+                        response = async_task.result()
+                        break
+
+                    power_checks += 1
+                    # nvidia-smi blocks, so run it in a thread to keep the POST progressing.
+                    current_power: list[float] = await asyncio.to_thread(
+                        self.get_current_power
+                    )
+                    for i in range(len(self.gpus)):
+                        power_accumulators[i] += current_power[i]
+            finally:
+                # If sampling failed, don't leave the request running on the loop.
+                async_task.cancel()
+
         except httpx.LocalProtocolError:
             # h11's message includes the offending header value, i.e. the API key.
             # "from None" keeps Python from printing the original exception too.
@@ -150,7 +205,9 @@ class LLMPowerStat:
         if response.status_code != 200:
             raise SystemError(f"API endpoint returned {response.status_code}!")
 
-        return float(response.json()["timings"]["predicted_per_second"])
+        return float(response.json()["timings"]["predicted_per_second"]), [
+            int(x / power_checks) for x in power_accumulators
+        ]
 
     # It can warm up for a little more minutes than specified, because it just runs the query until the time is up.
     # It will not kill the last query.
@@ -208,9 +265,12 @@ class LLMPowerStat:
                 flush=True,
             )
             self.set_power(power_value)
-            tps: float = self.run_prompt() if not self.dry_run else 0.0
-            print(f" TPS={tps:.2f}", flush=True)
-            yield power_value + [tps]
+            tps, power_averages = (
+                self.run_prompt() if not self.dry_run else (0.0, [0 for x in self.gpus])
+            )
+
+            print(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)
+            yield power_value + [str(x) for x in power_averages] + [tps]
 
 
 def main() -> None:
@@ -295,7 +355,7 @@ def main() -> None:
         f"Running power vs tokens-per-second test using http://{args.api_endpoint} API endpoint."
     )
 
-    power_stat = LLMPowerStat(
+    with LLMPowerStat(
         api_endpoint=args.api_endpoint,
         api_key_file=args.api_key_file,
         nvidia_smi_executable=args.nvidia_smi_executable,
@@ -304,26 +364,30 @@ def main() -> None:
         tokens_limit=args.tokens_limit,
         warmup_minutes=args.warmup_minutes,
         dry_run=args.dry_run,
-    )
+    ) as power_stat:
+        run(power_stat, args.output_file)
 
+
+def run(power_stat: LLMPowerStat, output_file: str | None) -> None:
     power_stat.print_gpus()
     if power_stat.warmup_minutes > 0:
         power_stat.warmup()
 
     results: Iterator = power_stat.run_analysis()
 
-    if args.output_file is None:
+    if output_file is None:
         for row in results:
             print(", ".join([str(x) for x in row]))
         return
 
-    with open(args.output_file, "+w") as f:
+    with open(output_file, "+w") as f:
         f.write(
             f"{', '.join([f'GPU{x!s} watts' for x in range(len(power_stat.gpus))])}, TPS\n"
         )
         for row in results:
             f.write(", ".join([str(x) for x in row]))
             f.write("\n")
+            f.flush()
 
 
 if __name__ == "__main__":
