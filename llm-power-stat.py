@@ -3,6 +3,7 @@ import re
 import subprocess
 import textwrap
 import time
+from collections.abc import Iterator
 from typing import NamedTuple
 
 import httpx
@@ -32,22 +33,25 @@ class LLMPowerStat:
     def __init__(
         self,
         api_endpoint: str,
-        output_file: str | None,
         api_key_file: str | None,
         nvidia_smi_executable: str,
         power_step_W: int,
         prompt: str,
         tokens_limit: int,
         warmup_minutes: int,
+        dry_run: bool,
     ) -> None:
         self.api_endpoint: str = api_endpoint
-        self.output_file: str | None = output_file
         self.api_key_file: str | None = api_key_file
         self.nvidia_smi_executable: str = nvidia_smi_executable
         self.power_step_W: int = power_step_W
         self.prompt: str = prompt
         self.tokens_limit: int = tokens_limit
         self.warmup_minutes: int = warmup_minutes
+        self.dry_run = dry_run
+
+        print("Listing local GPUs...")
+        self.gpus: list[GPU] = self.list_gpus()
 
         self.api_key: str | None = None
         if self.api_key_file is not None:
@@ -121,8 +125,8 @@ class LLMPowerStat:
         return gpus
 
     # Prints GPUs in list order, numbered the same way nvidia-smi does: "GPU 0: ...".
-    def print_gpus(self, gpus: list[GPU]) -> None:
-        for index, gpu in enumerate(gpus):
+    def print_gpus(self) -> None:
+        for index, gpu in enumerate(self.gpus):
             print(f"GPU {index}: {gpu.model_name} (UUID: {gpu.uuid})")
             print(f"  Power default limit: {gpu.power_default_limit}W")
             print(f"  Power min limit: {gpu.power_min_limit}W")
@@ -162,6 +166,45 @@ class LLMPowerStat:
         print(
             f"Warmed up for {int((int(time.monotonic()) - start_time) / 60)} minutes."
         )
+
+    def set_power(self, power_values: list[int]):
+        for i, gpu in enumerate(self.gpus):
+            self.run_smi(["-i", gpu.uuid, "-pl", str(power_values[i])])
+
+    def gen_power_steps(self, gpus: list[GPU]) -> Iterator[list[int]]:
+        if len(gpus) > 0:
+            gpu: GPU = gpus.pop()
+            for power in reversed(
+                range(
+                    gpu.power_min_limit,
+                    gpu.power_default_limit + self.power_step_W,
+                    self.power_step_W,
+                )
+            ):
+                if power > gpu.power_default_limit:
+                    continue
+
+                if len(gpus) > 0:
+                    for head in self.gen_power_steps(gpus.copy()):
+                        head.append(power)
+                        yield head
+                else:
+                    yield [power]
+
+    def run_analysis(self) -> Iterator[list]:
+        power_values: Iterator[list[int]] = self.gen_power_steps(self.gpus.copy())
+
+        for power_value in power_values:
+            print(
+                f"Setting power limits to {power_value}. Running prompt...",
+                end="",
+                flush=True,
+            )
+            if not self.dry_run:
+                self.set_power(power_value)
+            tps: float = self.run_prompt() if not self.dry_run else 0.0
+            print(f" TPS={tps:.2f}", flush=True)
+            yield power_value + [tps]
 
 
 def main() -> None:
@@ -234,6 +277,12 @@ def main() -> None:
         default=10,
     )
 
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Dry run.",
+    )
+
     args = parser.parse_args()
 
     print(
@@ -242,19 +291,33 @@ def main() -> None:
 
     power_stat = LLMPowerStat(
         api_endpoint=args.api_endpoint,
-        output_file=args.output_file,
         api_key_file=args.api_key_file,
         nvidia_smi_executable=args.nvidia_smi_executable,
         power_step_W=args.power_step_W,
         prompt=args.prompt,
         tokens_limit=args.tokens_limit,
         warmup_minutes=args.warmup_minutes,
+        dry_run=args.dry_run,
     )
 
-    print("Listing local GPUs...")
-    gpus: list[GPU] = power_stat.list_gpus()
-    power_stat.print_gpus(gpus)
-    power_stat.warmup()
+    power_stat.print_gpus()
+    if power_stat.warmup_minutes > 0:
+        power_stat.warmup()
+
+    results: Iterator = power_stat.run_analysis()
+
+    if args.output_file is None:
+        for row in results:
+            print(", ".join([str(x) for x in row]))
+        return
+
+    with open(args.output_file, "+w") as f:
+        f.write(
+            f"{', '.join([f'GPU{x!s} watts' for x in range(len(power_stat.gpus))])}, TPS\n"
+        )
+        for row in results:
+            f.write(", ".join([str(x) for x in row]))
+            f.write("\n")
 
 
 if __name__ == "__main__":
