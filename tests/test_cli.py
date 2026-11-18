@@ -40,6 +40,8 @@ class TestArgValidation:
             (["--power_step_W", "0"], "must be positive"),
             (["--tokens_limit", "0"], "must be positive"),
             (["--warmup_minutes", "-1"], "must not be negative"),
+            (["--sweeps", "0"], "must be positive"),
+            (["--sweeps", "-2"], "must be positive"),
         ],
     )
     def test_rejects_invalid_arguments(self, extra_args, message):
@@ -84,6 +86,23 @@ class TestDryRun:
             "GPU0 avg power W,GPU1 avg power W,TPS"
         ) in result.stderr
         # Dry run changes no power limits and sends no prompts.
+        assert smi.sets == []
+        assert server.requests == []
+
+
+class TestSweepsOption:
+    def test_sweeps_flag_repeats_full_sweep(self, server, make_smi):
+        smi = make_smi()
+        result = subprocess.run(
+            base_command(server) + ["--dry_run", "--sweeps", "2"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        rows = [line for line in result.stdout.splitlines() if line]
+        assert len(rows) == 2 * len(EXPECTED_LIMITS)
+        assert "Sweep 2 of 2." in result.stderr
         assert smi.sets == []
         assert server.requests == []
 

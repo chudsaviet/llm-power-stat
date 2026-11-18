@@ -44,6 +44,39 @@ class TestRun:
         assert smi.sets[-2:] == [(UUID_0, 280.0), (UUID_1, 200.0)]
         assert smi.limits() == {UUID_0: 280.0, UUID_1: 200.0}
 
+    def test_default_is_one_sweep(self, module, server, make_smi, tmp_path):
+        make_smi()
+        out = tmp_path / "results.csv"
+        with helpers.make_power_stat(module, server=server, power_step_W=100) as ps:
+            assert ps.sweeps == 1
+            module.run(ps, str(out))
+        assert len(read_rows(out)) == 1 + len(EXPECTED_LIMITS)
+
+    def test_runs_full_sweep_once_per_sweep_count(self, module, server, make_smi, tmp_path):
+        make_smi()
+        out = tmp_path / "results.csv"
+        with helpers.make_power_stat(
+            module, server=server, power_step_W=100, sweeps=3
+        ) as ps:
+            module.run(ps, str(out))
+        rows = read_rows(out)
+        assert len(rows) == 1 + 3 * len(EXPECTED_LIMITS)
+        # Each sweep repeats the full power order from the default limits.
+        limits = [row[1:3] for row in rows[1:]]
+        assert limits == [[str(x) for x in combo] for combo in EXPECTED_LIMITS * 3]
+        assert len(server.requests) == 3 * len(EXPECTED_LIMITS)
+
+    def test_dry_run_sweeps_write_rows_without_side_effects(self, module, server, make_smi, tmp_path):
+        smi = make_smi()
+        out = tmp_path / "results.csv"
+        with helpers.make_power_stat(
+            module, server=server, power_step_W=100, dry_run=True, sweeps=2
+        ) as ps:
+            module.run(ps, str(out))
+        assert len(read_rows(out)) == 1 + 2 * len(EXPECTED_LIMITS)
+        assert smi.sets == []
+        assert server.requests == []
+
     def test_every_measured_prompt_uses_the_same_seed(self, module, server, make_smi, tmp_path):
         make_smi()
         out = tmp_path / "results.csv"

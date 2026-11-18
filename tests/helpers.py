@@ -203,6 +203,7 @@ def make_power_stat(
     prompt: str = DEFAULT_PROMPT,
     tokens_limit: int = 42,
     warmup_minutes: int = 0,
+    sweeps: int = 1,
 ):
     """Build an LLMPowerStat wired to the fakes.
 
@@ -218,5 +219,6 @@ def make_power_stat(
         prompt=prompt,
         tokens_limit=tokens_limit,
         warmup_minutes=warmup_minutes,
+        sweeps=sweeps,
         dry_run=dry_run,
     )

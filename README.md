@@ -72,6 +72,7 @@ sudo .venv/bin/python llm-power-stat.py --api_endpoint localhost:8080 --output_f
 | `--prompt` | Pi calculation prompt | Prompt sent for every measurement. |
 | `--tokens_limit` | `3600` | `max_tokens` for each prompt. Must be > 0. |
 | `--warmup_minutes` | `10` | Minutes of prompts at default power before measuring. Must be >= 0. |
+| `--sweeps` | `1` | Number of times the full power sweep is repeated. Must be > 0. |
 | `--dry_run` | off | Do not change power limits and do not send prompts. Rows contain zeros. |
 
 ## Notes

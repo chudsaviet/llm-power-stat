@@ -72,6 +72,7 @@ class LLMPowerStat:
         prompt: str,
         tokens_limit: int,
         warmup_minutes: int,
+        sweeps: int,
         dry_run: bool,
     ) -> None:
         self.api_endpoint: str = api_endpoint
@@ -81,6 +82,7 @@ class LLMPowerStat:
         self.prompt: str = prompt
         self.tokens_limit: int = tokens_limit
         self.warmup_minutes: int = warmup_minutes
+        self.sweeps: int = sweeps
         self.dry_run = dry_run
         # One seed for the whole run, so every measured prompt generates the same text.
         self.seed: int = random.randrange(2**31)
@@ -334,26 +336,28 @@ class LLMPowerStat:
                     yield [power]
 
     def run_analysis(self) -> Iterator[list]:
-        power_values: Iterator[list[int]] = self.gen_power_steps(self.gpus.copy())
+        for sweep in range(1, self.sweeps + 1):
+            log(f"Sweep {sweep} of {self.sweeps}.")
+            power_values: Iterator[list[int]] = self.gen_power_steps(self.gpus.copy())
 
-        for power_value in power_values:
-            log(
-                f"Setting power limits to {power_value}. Running prompt...",
-                end="",
-                flush=True,
-            )
-            self.set_power(power_value)
-            tps, power_averages = (
-                self.run_prompt(self.seed)
-                if not self.dry_run
-                else (0.0, [0 for x in self.gpus])
-            )
+            for power_value in power_values:
+                log(
+                    f"Setting power limits to {power_value}. Running prompt...",
+                    end="",
+                    flush=True,
+                )
+                self.set_power(power_value)
+                tps, power_averages = (
+                    self.run_prompt(self.seed)
+                    if not self.dry_run
+                    else (0.0, [0 for x in self.gpus])
+                )
 
-            log(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)
-            # When the measurement finished, in local time with its UTC offset,
-            # e.g. 2026-11-17T14:03:27+01:00.
-            timestamp: str = datetime.now().astimezone().isoformat(timespec="seconds")
-            yield [timestamp] + power_value + [str(x) for x in power_averages] + [tps]
+                log(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)
+                # When the measurement finished, in local time with its UTC offset,
+                # e.g. 2026-11-17T14:03:27+01:00.
+                timestamp: str = datetime.now().astimezone().isoformat(timespec="seconds")
+                yield [timestamp] + power_value + [str(x) for x in power_averages] + [tps]
 
 
 def main() -> None:
@@ -427,6 +431,14 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--sweeps",
+        type=int,
+        required=False,
+        help="Number of times to run the full power sweep.",
+        default=1,
+    )
+
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Dry run.",
@@ -440,6 +452,8 @@ def main() -> None:
         parser.error("--tokens_limit must be positive.")
     if args.warmup_minutes < 0:
         parser.error("--warmup_minutes must not be negative.")
+    if args.sweeps <= 0:
+        parser.error("--sweeps must be positive.")
 
     log(
         f"Running power vs tokens-per-second test using {to_base_url(args.api_endpoint)} API endpoint."
@@ -456,6 +470,7 @@ def main() -> None:
         prompt=args.prompt,
         tokens_limit=args.tokens_limit,
         warmup_minutes=args.warmup_minutes,
+        sweeps=args.sweeps,
         dry_run=args.dry_run,
     ) as power_stat:
         run(power_stat, args.output_file)
