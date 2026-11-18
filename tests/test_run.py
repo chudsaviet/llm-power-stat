@@ -44,6 +44,16 @@ class TestRun:
         assert smi.sets[-2:] == [(UUID_0, 280.0), (UUID_1, 200.0)]
         assert smi.limits() == {UUID_0: 280.0, UUID_1: 200.0}
 
+    def test_every_measured_prompt_uses_the_same_seed(self, module, server, make_smi, tmp_path):
+        make_smi()
+        out = tmp_path / "results.csv"
+        with helpers.make_power_stat(module, server=server, power_step_W=100) as ps:
+            module.run(ps, str(out))
+            seed = ps.seed
+        seeds = [request["json"]["seed"] for request in server.requests]
+        assert len(seeds) == len(EXPECTED_LIMITS)
+        assert seeds == [seed] * len(EXPECTED_LIMITS)
+
     def test_appends_to_existing_file_without_repeating_header(self, module, server, make_smi, tmp_path):
         out = tmp_path / "results.csv"
         for _ in range(2):

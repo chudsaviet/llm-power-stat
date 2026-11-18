@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import random
 import re
 import signal
 import subprocess
@@ -81,6 +82,9 @@ class LLMPowerStat:
         self.tokens_limit: int = tokens_limit
         self.warmup_minutes: int = warmup_minutes
         self.dry_run = dry_run
+        # One seed for the whole run, so every measured prompt generates the same text.
+        self.seed: int = random.randrange(2**31)
+        log(f"Using seed {self.seed} for all measured prompts.")
 
         log("Listing local GPUs...")
         self.gpus: list[GPU] = self.list_gpus()
@@ -192,20 +196,26 @@ class LLMPowerStat:
         return result
 
     # Sync entry point: runs the async version on the object's event loop.
-    def run_prompt(self) -> tuple[float, list[int]]:
-        return self.runner.run(self._run_prompt_async())
+    def run_prompt(self, seed: int | None = None) -> tuple[float, list[int]]:
+        return self.runner.run(self._run_prompt_async(seed))
 
-    async def _run_prompt_async(self) -> tuple[float, list[int]]:
+    async def _run_prompt_async(self, seed: int | None) -> tuple[float, list[int]]:
         power_checks: int = 0
         power_accumulators: list[float] = [0.0 for x in self.gpus]
+        payload: dict = {
+            "messages": [{"role": "user", "content": self.prompt}],
+            "max_tokens": self.tokens_limit,
+            "temperature": 0.0,
+            "top_k": 1,
+        }
+        # Omitted (not null) when None, so the server picks its own seed.
+        if seed is not None:
+            payload["seed"] = seed
         try:
             async_task: asyncio.Task = asyncio.create_task(
                 self.http_client.post(
                     "/v1/chat/completions",
-                    json={
-                        "messages": [{"role": "user", "content": self.prompt}],
-                        "max_tokens": self.tokens_limit,
-                    },
+                    json=payload,
                 )
             )
 
@@ -334,7 +344,9 @@ class LLMPowerStat:
             )
             self.set_power(power_value)
             tps, power_averages = (
-                self.run_prompt() if not self.dry_run else (0.0, [0 for x in self.gpus])
+                self.run_prompt(self.seed)
+                if not self.dry_run
+                else (0.0, [0 for x in self.gpus])
             )
 
             log(f" TPS={tps:.2f} Power averages={power_averages}", flush=True)

@@ -33,6 +33,26 @@ class TestRunPrompt:
         assert request["json"]["messages"] == [{"role": "user", "content": "Count to ten."}]
         assert request["json"]["max_tokens"] == 42
 
+    def test_sends_deterministic_sampling_settings(self, module, server, make_smi):
+        make_smi()
+        with helpers.make_power_stat(module, server=server) as ps:
+            ps.run_prompt()
+        assert server.requests[0]["json"]["temperature"] == 0.0
+        assert server.requests[0]["json"]["top_k"] == 1
+
+    def test_seed_sent_when_given(self, module, server, make_smi):
+        make_smi()
+        with helpers.make_power_stat(module, server=server) as ps:
+            ps.run_prompt(seed=12345)
+        assert server.requests[0]["json"]["seed"] == 12345
+
+    def test_seed_omitted_when_not_given(self, module, server, make_smi):
+        # Warmup calls run_prompt() without a seed; the key must be absent, not null.
+        make_smi()
+        with helpers.make_power_stat(module, server=server) as ps:
+            ps.run_prompt()
+        assert "seed" not in server.requests[0]["json"]
+
     def test_samples_power_while_request_runs(self, module, server, make_smi):
         # Counting draws: each sample is 10 W higher than the previous one, so an
         # exact match with the logged mean proves the samples were averaged,
