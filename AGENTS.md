@@ -20,10 +20,15 @@ At the end, or on any error, it puts every GPU's power limit back to what it was
 | File | Purpose |
 |---|---|
 | `llm-power-stat.py` | The whole program. There are no other source files. |
-| `requirements.txt` | Runtime dependencies (only `httpx`). |
+| `requirements.txt` | Dependencies: `httpx` at runtime, `pytest` for the test suite. |
 | `LICENSE` | License. |
+| `tests/` | The test suite (pytest): `fake_nvidia_smi.py` (a fake `nvidia-smi`), `helpers.py` (module loader, fake llama.cpp server, state-file handle) and the `test_*.py` files. |
 
-There are no tests in the repository right now.
+The test suite needs no GPUs, no llama.cpp server and no root:
+
+```bash
+.venv/bin/python -m pytest tests/ -v
+```
 
 ## Requirements
 
@@ -138,16 +143,17 @@ The script changes real hardware settings. A bug can leave GPUs power-limited af
 - The API key must never appear in error messages. That is why `httpx.LocalProtocolError` is caught and replaced, and why the key is checked for bad characters in `__init__`.
 - `nvidia-smi` is called without `--format`. Output is parsed as: line 0 = header, line 1 = values, comma-separated, with a ` W` suffix to strip. Keep this format if you add queries.
 
-## Testing changes without GPUs
+## Testing without GPUs
 
-There is no test suite. To check a change without real GPUs or a server:
+The test suite in `tests/` runs the whole program against fakes, so it needs no GPUs, no llama.cpp server and no root:
 
-1. Use `--dry_run` to check argument handling and CSV output.
-2. For anything else, write a fake `nvidia-smi` script (pass it with `--nvidia-smi-executable`) that prints output in the same format, and a small local HTTP server that answers `POST /v1/chat/completions` with `{"timings": {"predicted_per_second": 33.3}}`.
+- `tests/fake_nvidia_smi.py` is a fake `nvidia-smi` (pass it with `--nvidia-smi-executable`). It reads/writes a JSON state file whose path comes from the `FAKE_SMI_STATE` environment variable, prints output in the same format the program parses, and records every `-pl` and every `power.draw` in a log the tests assert on. Set it up with the `make_smi` fixture in `tests/conftest.py`.
+- `tests/helpers.py` provides `FakeLLMCppServer`, a local threaded HTTP server that answers `POST /v1/chat/completions` with `{"timings": {"predicted_per_second": 33.3}}` (configurable status, delay and body) and records every request.
+- Run it with `.venv/bin/python -m pytest tests/ -v`.
 
-Put these helper files outside the repository unless the maintainer asks for tests.
+When adding a test, keep it in `tests/` and build on these fakes rather than re-inventing them. Keep the suite runnable on a laptop with no NVIDIA hardware.
 
-Because the file name contains hyphens, `import llm-power-stat` does not work. Load it like this:
+Because the file name contains hyphens, `import llm-power-stat` does not work. The suite loads it like this (see `helpers.load_module()`):
 
 ```python
 import importlib.util
